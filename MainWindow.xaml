@@ -1,0 +1,106 @@
+﻿<Window x:Class="ComplexityAnalyzer.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        xmlns:local="clr-namespace:ComplexityAnalyzer"
+        mc:Ignorable="d"
+        Title="C# Complexity Analyzer" Height="900" Width="1150"
+        MinHeight="650" MinWidth="850" Background="#F4F6FA">
+    <Window.Resources>
+        <DataTemplate x:Key="WrappedTextTemplate">
+            <TextBlock Text="{Binding}" TextWrapping="Wrap" Foreground="#3F4A5E" Margin="0,0,0,5" />
+        </DataTemplate>
+    </Window.Resources>
+    <Grid Margin="24">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <StackPanel Grid.Row="0" Margin="0,0,0,18">
+            <TextBlock Text="C# Complexity Analyzer" FontSize="28" FontWeight="SemiBold" Foreground="#172033" />
+            <TextBlock Text="Paste C# code to estimate worst-case time and auxiliary-space complexity." Margin="0,5,0,0" FontSize="14" Foreground="#5E687A" />
+        </StackPanel>
+
+        <Grid Grid.Row="1">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="3*" MinHeight="220" />
+                <RowDefinition Height="2*" MinHeight="190" />
+            </Grid.RowDefinitions>
+
+            <Border Grid.Row="0" Background="White" BorderBrush="#D9DFE9" BorderThickness="1" CornerRadius="8" Padding="14" Margin="0,0,0,14">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <DockPanel Grid.Row="0" Margin="0,0,0,10">
+                        <TextBlock Text="C# source" FontWeight="SemiBold" FontSize="15" Foreground="#172033" VerticalAlignment="Center" />
+                        <Button x:Name="AnalyzeButton" Content="Analyze code" DockPanel.Dock="Right" Padding="18,8" Background="#3157C8" Foreground="White" BorderThickness="0" FontWeight="SemiBold" Click="AnalyzeButton_Click" />
+                    </DockPanel>
+                    <TextBox x:Name="CodeInput" Grid.Row="1" AcceptsReturn="True" AcceptsTab="True" TextWrapping="NoWrap"
+                             VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"
+                             FontFamily="Consolas" FontSize="14" Padding="12" BorderBrush="#E1E5ED"
+                             Background="#FBFCFE" SpellCheck.IsEnabled="False" />
+                    <Button Grid.Row="2" Content="Clear" HorizontalAlignment="Right" Margin="0,8,0,0"
+                            Padding="10,4" Background="#3157C8" Foreground="White" BorderThickness="0"
+                            Click="ClearButton_Click" />
+                </Grid>
+            </Border>
+
+            <Border Grid.Row="1" Background="White" BorderBrush="#D9DFE9" BorderThickness="1" CornerRadius="8" Padding="16">
+                <ScrollViewer VerticalScrollBarVisibility="Auto">
+                    <StackPanel>
+                        <DockPanel Margin="0,0,0,12">
+                            <TextBlock Text="Analysis results" FontSize="18" FontWeight="SemiBold" Foreground="#172033" />
+                            <TextBlock x:Name="ConfidenceText" DockPanel.Dock="Right" Text="Confidence: —" Foreground="#5E687A" VerticalAlignment="Center" />
+                        </DockPanel>
+                        <Grid Margin="0,0,0,12">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <Border Grid.Column="0" Background="#F2F5FF" CornerRadius="6" Padding="12" Margin="0,0,6,0">
+                                <StackPanel>
+                                    <TextBlock Text="TIME COMPLEXITY" FontSize="11" FontWeight="SemiBold" Foreground="#53658F" />
+                                    <TextBlock x:Name="TimeComplexityText" Text="—" FontSize="22" FontWeight="SemiBold" Foreground="#2448B2" Margin="0,4,0,0" TextWrapping="Wrap" />
+                                </StackPanel>
+                            </Border>
+                            <Border Grid.Column="1" Background="#F2F8F5" CornerRadius="6" Padding="12" Margin="6,0,0,0">
+                                <StackPanel>
+                                    <TextBlock Text="AUXILIARY SPACE" FontSize="11" FontWeight="SemiBold" Foreground="#527660" />
+                                    <TextBlock x:Name="SpaceComplexityText" Text="—" FontSize="22" FontWeight="SemiBold" Foreground="#247042" Margin="0,4,0,0" TextWrapping="Wrap" />
+                                </StackPanel>
+                            </Border>
+                        </Grid>
+                        <TextBlock x:Name="ExplanationText" Text="Enter code and select Analyze code to see an estimate." TextWrapping="Wrap" Foreground="#3F4A5E" Margin="0,0,0,12" />
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <StackPanel Grid.Column="0" Margin="0,0,10,0">
+                                <TextBlock Text="Assumptions" FontWeight="SemiBold" Foreground="#172033" Margin="0,0,0,5" />
+                                <ItemsControl x:Name="AssumptionsList" ItemTemplate="{StaticResource WrappedTextTemplate}" />
+                            </StackPanel>
+                            <StackPanel Grid.Column="1" Margin="0,0,10,0">
+                                <TextBlock Text="Warnings" FontWeight="SemiBold" Foreground="#8A5B11" Margin="0,0,0,5" />
+                                <ItemsControl x:Name="WarningsList" ItemTemplate="{StaticResource WrappedTextTemplate}" />
+                            </StackPanel>
+                            <StackPanel Grid.Column="2">
+                                <TextBlock Text="Syntax diagnostics" FontWeight="SemiBold" Foreground="#9E3636" Margin="0,0,0,5" />
+                                <ItemsControl x:Name="SyntaxErrorsList" ItemTemplate="{StaticResource WrappedTextTemplate}" />
+                            </StackPanel>
+                        </Grid>
+                    </StackPanel>
+                </ScrollViewer>
+            </Border>
+        </Grid>
+
+        <TextBlock Grid.Row="2" Text="Heuristic static analysis only — arbitrary C# complexity cannot be determined exactly." Margin="2,10,0,0" FontSize="12" Foreground="#6B7483" />
+    </Grid>
+</Window>
