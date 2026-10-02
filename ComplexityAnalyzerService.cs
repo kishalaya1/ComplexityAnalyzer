@@ -39,6 +39,63 @@ public sealed class ComplexityAnalyzerService
         if (syntaxErrors.Length > 0)
             warnings.Add("The input has syntax errors; results may be incomplete.");
 
+        if (syntaxErrors.Length == 0 && TryRecognizeDijkstra(root))
+        {
+            assumptions.Add("Recognized Dijkstra estimates assume an adjacency-list graph and a binary priority queue that may hold duplicate entries.");
+            assumptions.Add("The input graph is excluded from auxiliary space; distances and lazy priority-queue entries require O(V + E) space.");
+            warnings.Add("The Dijkstra pattern is inferred syntactically; nonnegative edge weights and algorithm correctness are not verified.");
+            return new AnalysisResult(
+                "O((V + E) log E)",
+                "O(V + E)",
+                "A Dijkstra-style adjacency-list traversal with a priority queue and stale-entry guard was recognized.",
+                assumptions.ToArray(),
+                warnings.ToArray(),
+                75,
+                syntaxErrors);
+        }
+
+        if (syntaxErrors.Length == 0 && TryRecognizeHeapSort(root, out var heapSortSpace))
+        {
+            assumptions.Add("Recognized heap sort assumes an in-place binary heap over the input array; recursive sift-down, if present, adds logarithmic stack space.");
+            warnings.Add("Heap-sort complexity is inferred from method structure; ordering and heap-property correctness are not verified.");
+            return new AnalysisResult(
+                "O(n log n)",
+                heapSortSpace,
+                "An in-place heap sort with heap construction and sift-down operations was recognized.",
+                assumptions.ToArray(),
+                warnings.ToArray(),
+                75,
+                syntaxErrors);
+        }
+
+        if (syntaxErrors.Length == 0 && TryRecognizeTopologicalSort(root))
+        {
+            assumptions.Add("Recognized Kahn-style topological sorting assumes an adjacency-list graph; the input graph is excluded from auxiliary space.");
+            warnings.Add("Topological-sort complexity is inferred syntactically; graph validity and cycle handling are not verified.");
+            return new AnalysisResult(
+                "O(V + E)",
+                "O(V)",
+                "A queue-based topological traversal with indegree tracking was recognized.",
+                assumptions.ToArray(),
+                warnings.ToArray(),
+                75,
+                syntaxErrors);
+        }
+
+        if (syntaxErrors.Length == 0 && TryRecognizeAdditionalAlgorithm(root, out var recognizedAlgorithm))
+        {
+            assumptions.Add(recognizedAlgorithm.Assumption);
+            warnings.Add(recognizedAlgorithm.Warning);
+            return new AnalysisResult(
+                recognizedAlgorithm.Time,
+                recognizedAlgorithm.Space,
+                recognizedAlgorithm.Explanation,
+                assumptions.ToArray(),
+                warnings.ToArray(),
+                75,
+                syntaxErrors);
+        }
+
         var declaredMethods = root.DescendantNodes().OfType<MethodDeclarationSyntax>()
             .Select(method => method.Identifier.ValueText)
             .ToHashSet(StringComparer.Ordinal);
@@ -56,19 +113,27 @@ public sealed class ComplexityAnalyzerService
 
             hasMethod = true;
             var body = (SyntaxNode?)method.Body ?? method.ExpressionBody!.Expression;
-            var methodTime = AnalyzeNode(body, warnings, declaredMethods);
-            var recursiveCalls = body.DescendantNodes().OfType<InvocationExpressionSyntax>()
+            var hasUnanalyzedHelperCalls = HasUnanalyzedHelperCalls(body, method.Identifier.ValueText, declaredMethods);
+            if (hasUnanalyzedHelperCalls)
+                warnings.Add($"Method '{method.Identifier.ValueText}' calls another method in the input; call costs are not composed, so its time and auxiliary-space estimates are reported as unknown.");
+
+            var methodTime = hasUnanalyzedHelperCalls ? Complexity.UnknownComplexity : AnalyzeNode(body, warnings, declaredMethods);
+            var recursiveCalls = body.DescendantNodesAndSelf().OfType<InvocationExpressionSyntax>()
                 .Count(invocation => GetInvokedName(invocation) == method.Identifier.ValueText);
 
             if (recursiveCalls > 0)
             {
-                methodTime = EstimateRecursion(method, recursiveCalls, warnings, assumptions);
-                var recursiveStack = HasHalvingReduction(body) ? Complexity.Logarithmic : Complexity.Linear;
+                var localWork = hasUnanalyzedHelperCalls ? Complexity.UnknownComplexity : AnalyzeNode(body, warnings, declaredMethods);
+                var recursiveCallsPerPath = GetRecursiveCallsPerPath(body, method.Identifier.ValueText);
+                var recursiveCallInLoop = HasRecursiveCallInLoop(body, method.Identifier.ValueText, out var unknownLoopBound);
+                methodTime = EstimateRecursion(method, recursiveCallsPerPath, recursiveCallInLoop, unknownLoopBound, localWork, warnings, assumptions);
+                var recursiveStack = HasHalvingReduction(method) ? Complexity.Logarithmic :
+                    HasLinearReduction(method) ? Complexity.Linear : Complexity.UnknownComplexity;
                 space = Complexity.Max(space, recursiveStack);
             }
 
             time = Complexity.Max(time, methodTime);
-            space = Complexity.Max(space, AnalyzeSpace(body, warnings));
+            space = Complexity.Max(space, hasUnanalyzedHelperCalls ? Complexity.UnknownComplexity : AnalyzeSpace(body, warnings));
         }
 
         if (!hasMethod)
@@ -115,6 +180,8 @@ public sealed class ComplexityAnalyzerService
             case BlockSyntax block:
                 return AnalyzeSequence(block.Statements, warnings, declaredMethods);
             case ForStatementSyntax forStatement:
+                if (IsCountingSortExpansion(forStatement))
+                    return Complexity.Linear;
                 return AnalyzeLoop(forStatement, forStatement.Statement, warnings, declaredMethods);
             case ForEachStatementSyntax forEach:
                 return Complexity.Linear.Multiply(AnalyzeNode(forEach.Statement, warnings, declaredMethods));
@@ -130,6 +197,7 @@ public sealed class ComplexityAnalyzerService
                 if (ifStatement.Condition.IsKind(SyntaxKind.FalseLiteralExpression))
                     return ifStatement.Else is null ? Complexity.Constant : AnalyzeNode(ifStatement.Else.Statement, warnings, declaredMethods);
                 return Complexity.Max(
+                    AnalyzeExpressionCosts(ifStatement.Condition, warnings, declaredMethods),
                     AnalyzeNode(ifStatement.Statement, warnings, declaredMethods),
                     ifStatement.Else is null ? Complexity.Constant : AnalyzeNode(ifStatement.Else.Statement, warnings, declaredMethods));
             case SwitchStatementSyntax switchStatement:
@@ -168,7 +236,9 @@ public sealed class ComplexityAnalyzerService
             warnings.Add("A loop has no safely recognizable termination or progress condition; its bound is reported as unknown.");
         else if (bound.IsLogarithmic)
             warnings.Add("A logarithmic loop bound is inferred from its update expression; confirm that the value progresses toward termination.");
-        return bound.Multiply(AnalyzeNode(body, warnings, declaredMethods));
+        var bodyCost = AnalyzeNode(body, warnings, declaredMethods);
+        var conditionCost = condition is null ? Complexity.Constant : AnalyzeExpressionCosts(condition, warnings, declaredMethods);
+        return bound.Multiply(Complexity.Max(bodyCost, conditionCost));
     }
 
     private static Complexity GetLoopBound(SyntaxNode loop)
@@ -210,8 +280,19 @@ public sealed class ComplexityAnalyzerService
         var bound = Complexity.Max(bounds.Select(boundExpression => EstimateBound(boundExpression)).ToArray());
         var counter = controlVariables.FirstOrDefault();
         var fixedIterations = bound == Complexity.Constant && counter is not null && IsInitializedToConstant(loop, counter);
-        if (ContainsMultiplicativeUpdate(update))
+        if (IsEuclideanReduction(loop, condition, controlVariables))
+            return Complexity.Logarithmic;
+        if (updates.OfType<AssignmentExpressionSyntax>().Any(assignment => IsFenwickProgress(assignment, controlVariables)))
+            return Complexity.Logarithmic;
+        if (HasHalvingProgress(loop, controlVariables))
             return fixedIterations ? Complexity.Constant : Complexity.Logarithmic;
+        if (ContainsMultiplicativeUpdate(update))
+        {
+            if (bound == Complexity.Constant && condition is not null &&
+                GetInputDerivedBound(condition, controlVariables) != Complexity.Constant)
+                return Complexity.Logarithmic;
+            return fixedIterations ? Complexity.Constant : Complexity.Logarithmic;
+        }
 
         if (!ContainsUnitProgress(update) && !updates.Any(IsUnitProgressExpression))
             return Complexity.UnknownComplexity;
@@ -237,6 +318,68 @@ public sealed class ComplexityAnalyzerService
         return [comparison.Right];
     }
 
+    private static Complexity GetInputDerivedBound(ExpressionSyntax condition, HashSet<string> controlVariables)
+    {
+        var inferredBounds = condition.DescendantNodesAndSelf().OfType<BinaryExpressionSyntax>()
+            .Where(IsComparison)
+            .SelectMany(comparison => new[] { comparison.Left, comparison.Right })
+            .Where(expression => expression.DescendantNodesAndSelf().OfType<IdentifierNameSyntax>()
+                .Any(identifier => controlVariables.Contains(identifier.Identifier.ValueText)))
+            .SelectMany(expression => expression.DescendantNodesAndSelf().OfType<BinaryExpressionSyntax>())
+            .Select(binary =>
+            {
+                var leftIsControl = binary.Left.DescendantNodesAndSelf().OfType<IdentifierNameSyntax>()
+                    .Any(identifier => controlVariables.Contains(identifier.Identifier.ValueText));
+                var rightIsControl = binary.Right.DescendantNodesAndSelf().OfType<IdentifierNameSyntax>()
+                    .Any(identifier => controlVariables.Contains(identifier.Identifier.ValueText));
+                return leftIsControl == rightIsControl
+                    ? Complexity.Constant
+                    : EstimateBound(leftIsControl ? binary.Right : binary.Left);
+            })
+            .ToArray();
+        return Complexity.Max(inferredBounds);
+    }
+
+    private static bool IsCountingSortExpansion(ForStatementSyntax outerLoop)
+    {
+        var outerCounter = outerLoop.Declaration?.Variables.FirstOrDefault();
+        if (outerCounter is null || outerLoop.Condition is not BinaryExpressionSyntax outerCondition ||
+            outerCondition.Left is not IdentifierNameSyntax outerIdentifier ||
+            outerIdentifier.Identifier.ValueText != outerCounter.Identifier.ValueText ||
+            outerCondition.Right is not MemberAccessExpressionSyntax
+            {
+                Expression: IdentifierNameSyntax countsIdentifier,
+                Name.Identifier.ValueText: "Length"
+            })
+            return false;
+
+        var method = outerLoop.Ancestors().OfType<MethodDeclarationSyntax>().FirstOrDefault();
+        if (method is null || !method.DescendantNodes().OfType<PostfixUnaryExpressionSyntax>().Any(increment =>
+                increment.IsKind(SyntaxKind.PostIncrementExpression) &&
+                increment.Operand is ElementAccessExpressionSyntax access &&
+                access.Expression is IdentifierNameSyntax arrayName &&
+                arrayName.Identifier.ValueText == countsIdentifier.Identifier.ValueText))
+            return false;
+
+        var innerLoops = outerLoop.Statement switch
+        {
+            ForStatementSyntax innerLoop => new[] { innerLoop },
+            BlockSyntax { Statements.Count: 1 } block when block.Statements[0] is ForStatementSyntax innerLoop => new[] { innerLoop },
+            _ => Array.Empty<ForStatementSyntax>()
+        };
+        return innerLoops.Any(innerLoop =>
+            innerLoop.Declaration?.Variables.FirstOrDefault() is { } innerCounter &&
+            innerLoop.Condition is BinaryExpressionSyntax innerCondition &&
+            innerCondition.Left is IdentifierNameSyntax innerIdentifier &&
+            innerIdentifier.Identifier.ValueText == innerCounter.Identifier.ValueText &&
+            innerCondition.Right is ElementAccessExpressionSyntax frequency &&
+            frequency.Expression is IdentifierNameSyntax frequencyArray &&
+            frequencyArray.Identifier.ValueText == countsIdentifier.Identifier.ValueText &&
+            frequency.ArgumentList.Arguments.Any(argument => argument.Expression.DescendantNodesAndSelf()
+                .OfType<IdentifierNameSyntax>().Any(identifier => identifier.Identifier.ValueText == outerCounter.Identifier.ValueText)) &&
+            innerLoop.Incrementors.Any(IsUnitProgressExpression));
+    }
+
     private static IEnumerable<string> GetUpdatedIdentifiers(SyntaxNode loop)
     {
         foreach (var expression in GetLoopUpdateExpressions(loop))
@@ -251,6 +394,60 @@ public sealed class ComplexityAnalyzerService
             yield return unaryIdentifier.Identifier.ValueText;
         if (expression is AssignmentExpressionSyntax assignment && assignment.Left is IdentifierNameSyntax identifier)
             yield return identifier.Identifier.ValueText;
+        if (expression is AssignmentExpressionSyntax { Left: TupleExpressionSyntax tuple })
+            foreach (var tupleIdentifier in tuple.DescendantNodesAndSelf().OfType<IdentifierNameSyntax>())
+                yield return tupleIdentifier.Identifier.ValueText;
+    }
+
+    private static bool IsEuclideanReduction(SyntaxNode loop, ExpressionSyntax? condition, HashSet<string> controlVariables)
+    {
+        var body = loop switch
+        {
+            WhileStatementSyntax statement => statement.Statement,
+            DoStatementSyntax statement => statement.Statement,
+            _ => null
+        };
+        if (body is null || condition is null ||
+            !condition.DescendantNodesAndSelf().OfType<BinaryExpressionSyntax>().Any(comparison =>
+                IsComparison(comparison) &&
+                ((comparison.Left is IdentifierNameSyntax left && controlVariables.Contains(left.Identifier.ValueText) && IsZeroLiteral(comparison.Right)) ||
+                 (comparison.Right is IdentifierNameSyntax right && controlVariables.Contains(right.Identifier.ValueText) && IsZeroLiteral(comparison.Left)))))
+            return false;
+
+        return body.DescendantNodesAndSelf().OfType<AssignmentExpressionSyntax>().Any(assignment =>
+            assignment.Left is TupleExpressionSyntax leftTuple && leftTuple.Arguments.Count >= 2 &&
+            leftTuple.Arguments.Any(argument => argument.Expression is IdentifierNameSyntax identifier &&
+                                                 controlVariables.Contains(identifier.Identifier.ValueText)) &&
+            assignment.Right is TupleExpressionSyntax rightTuple &&
+            rightTuple.DescendantNodesAndSelf().OfType<BinaryExpressionSyntax>()
+                .Any(binary => binary.IsKind(SyntaxKind.ModuloExpression)));
+    }
+
+    private static bool IsZeroLiteral(ExpressionSyntax expression) =>
+        expression is LiteralExpressionSyntax literal && literal.Token.Value is IConvertible value && value.ToDouble(null) == 0;
+
+    private static bool IsFenwickProgress(AssignmentExpressionSyntax assignment, HashSet<string> controlVariables)
+    {
+        if ((!assignment.IsKind(SyntaxKind.AddAssignmentExpression) && !assignment.IsKind(SyntaxKind.SubtractAssignmentExpression)) ||
+            assignment.Left is not IdentifierNameSyntax variable || !controlVariables.Contains(variable.Identifier.ValueText) ||
+            assignment.Right is not BinaryExpressionSyntax { RawKind: (int)SyntaxKind.BitwiseAndExpression } bitwiseAnd)
+            return false;
+
+        var leftUsesVariable = bitwiseAnd.Left.DescendantNodesAndSelf().OfType<IdentifierNameSyntax>()
+            .Any(identifier => identifier.Identifier.ValueText == variable.Identifier.ValueText);
+        var rightUsesNegatedVariable = bitwiseAnd.Right is PrefixUnaryExpressionSyntax
+            {
+                RawKind: (int)SyntaxKind.UnaryMinusExpression,
+                Operand: IdentifierNameSyntax negatedVariable
+            } && negatedVariable.Identifier.ValueText == variable.Identifier.ValueText;
+        var rightUsesVariable = bitwiseAnd.Right.DescendantNodesAndSelf().OfType<IdentifierNameSyntax>()
+            .Any(identifier => identifier.Identifier.ValueText == variable.Identifier.ValueText);
+        var leftIsNegatedVariable = bitwiseAnd.Left is PrefixUnaryExpressionSyntax
+            {
+                RawKind: (int)SyntaxKind.UnaryMinusExpression,
+                Operand: IdentifierNameSyntax negatedLeftVariable
+            } && negatedLeftVariable.Identifier.ValueText == variable.Identifier.ValueText;
+        return (leftUsesVariable && rightUsesNegatedVariable) || (rightUsesVariable && leftIsNegatedVariable);
     }
 
     private static IEnumerable<ExpressionSyntax> GetLoopUpdateExpressions(SyntaxNode loop)
@@ -327,6 +524,10 @@ public sealed class ComplexityAnalyzerService
 
     private static bool IsUnitProgressExpression(ExpressionSyntax expression)
     {
+        if (expression is PrefixUnaryExpressionSyntax or PostfixUnaryExpressionSyntax &&
+            expression.Kind() is SyntaxKind.PreIncrementExpression or SyntaxKind.PreDecrementExpression or
+                SyntaxKind.PostIncrementExpression or SyntaxKind.PostDecrementExpression)
+            return true;
         if (expression is not AssignmentExpressionSyntax assignment ||
             assignment.Left is not IdentifierNameSyntax variable)
             return false;
@@ -334,9 +535,42 @@ public sealed class ComplexityAnalyzerService
             return true;
         return assignment.Right is BinaryExpressionSyntax binary &&
             (binary.IsKind(SyntaxKind.AddExpression) || binary.IsKind(SyntaxKind.SubtractExpression)) &&
-            binary.Left is IdentifierNameSyntax updatedVariable && updatedVariable.Identifier.ValueText == variable.Identifier.ValueText &&
-            IsNumericLiteral(binary.Right);
+            ((binary.Left is IdentifierNameSyntax updatedVariable && updatedVariable.Identifier.ValueText == variable.Identifier.ValueText && IsNumericLiteral(binary.Right)) ||
+             (binary.Right is IdentifierNameSyntax otherUpdatedVariable && otherUpdatedVariable.Identifier.ValueText == variable.Identifier.ValueText && IsNumericLiteral(binary.Left)));
     }
+
+    private static bool HasHalvingProgress(SyntaxNode loop, HashSet<string> controlVariables)
+    {
+        var body = loop switch
+        {
+            WhileStatementSyntax statement => statement.Statement,
+            DoStatementSyntax statement => statement.Statement,
+            ForStatementSyntax statement => statement.Statement,
+            _ => null
+        };
+        if (body is null)
+            return false;
+
+        var halvedVariables = body.DescendantNodes().OfType<VariableDeclaratorSyntax>()
+            .Where(variable => IsHalvingExpression(variable.Initializer?.Value))
+            .Select(variable => variable.Identifier.ValueText)
+            .Concat(body.DescendantNodes().OfType<AssignmentExpressionSyntax>()
+                .Where(assignment => assignment.Left is IdentifierNameSyntax && IsHalvingExpression(assignment.Right))
+                .Select(assignment => ((IdentifierNameSyntax)assignment.Left).Identifier.ValueText))
+            .ToHashSet(StringComparer.Ordinal);
+
+        return body.DescendantNodes().OfType<AssignmentExpressionSyntax>().Any(assignment =>
+            assignment.Left is IdentifierNameSyntax left && controlVariables.Contains(left.Identifier.ValueText) &&
+            assignment.Right.DescendantNodesAndSelf().OfType<IdentifierNameSyntax>()
+                .Any(identifier => halvedVariables.Contains(identifier.Identifier.ValueText)));
+    }
+
+    private static bool IsHalvingExpression(ExpressionSyntax? expression) => expression?.DescendantNodesAndSelf()
+        .OfType<BinaryExpressionSyntax>()
+        .Any(binary => binary.IsKind(SyntaxKind.DivideExpression) && IsNumericLiteral(binary.Right) &&
+                       binary.Right is LiteralExpressionSyntax literal && Convert.ToDouble(literal.Token.Value) == 2 ||
+                       binary.IsKind(SyntaxKind.RightShiftExpression) && IsNumericLiteral(binary.Right) &&
+                       binary.Right is LiteralExpressionSyntax shift && Convert.ToDouble(shift.Token.Value) == 1) == true;
 
     private static Complexity AnalyzeExpressionCosts(SyntaxNode node, HashSet<string> warnings, HashSet<string> declaredMethods)
     {
@@ -349,7 +583,9 @@ public sealed class ComplexityAnalyzerService
         foreach (var invocation in node.DescendantNodesAndSelf().OfType<InvocationExpressionSyntax>())
         {
             var name = GetInvokedName(invocation);
-            var operation = name switch
+            var operation = IsConstantTimeMathOperation(invocation) || invocation.Expression is not MemberAccessExpressionSyntax
+                ? Complexity.Constant
+                : name switch
             {
                 "Sort" or "OrderBy" or "OrderByDescending" or "ThenBy" or "ThenByDescending" => Complexity.Linearithmic,
                 "BinarySearch" => Complexity.Logarithmic,
@@ -364,6 +600,13 @@ public sealed class ComplexityAnalyzerService
         return result;
     }
 
+    private static bool IsConstantTimeMathOperation(InvocationExpressionSyntax invocation) =>
+        invocation.Expression is MemberAccessExpressionSyntax
+        {
+            Expression: IdentifierNameSyntax typeName,
+            Name.Identifier.ValueText: "Min" or "Max"
+        } && typeName.Identifier.ValueText is "Math" or "MathF";
+
     private static string GetInvokedName(InvocationExpressionSyntax invocation) => invocation.Expression switch
     {
         IdentifierNameSyntax identifier => identifier.Identifier.ValueText,
@@ -372,21 +615,308 @@ public sealed class ComplexityAnalyzerService
         _ => string.Empty
     };
 
-    private static Complexity EstimateRecursion(MethodDeclarationSyntax method, int recursiveCalls, HashSet<string> warnings, HashSet<string> assumptions)
+    private static bool HasUnanalyzedHelperCalls(SyntaxNode body, string currentMethod, HashSet<string> declaredMethods) =>
+        body.DescendantNodesAndSelf().OfType<InvocationExpressionSyntax>()
+            .Any(invocation => GetInvokedName(invocation) is var name && name != currentMethod && declaredMethods.Contains(name));
+
+    private static bool TryRecognizeDijkstra(SyntaxNode root)
     {
-        var body = method.Body?.ToString() ?? method.ExpressionBody?.ToString() ?? string.Empty;
+        var methods = root.DescendantNodes().OfType<MethodDeclarationSyntax>();
+        return methods.Any(method =>
+        {
+            if (!method.Identifier.ValueText.Contains("Dijkstra", StringComparison.OrdinalIgnoreCase) || method.Body is null)
+                return false;
+
+            var nodes = method.Body.DescendantNodesAndSelf();
+            var hasPriorityQueue = nodes.OfType<GenericNameSyntax>()
+                .Any(name => name.Identifier.ValueText == "PriorityQueue");
+            var hasEnqueue = nodes.OfType<InvocationExpressionSyntax>()
+                .Any(invocation => GetInvokedName(invocation) == "Enqueue");
+            var hasStaleEntryGuard = nodes.OfType<IfStatementSyntax>().Any(statement =>
+                statement.Condition.DescendantNodesAndSelf().OfType<BinaryExpressionSyntax>()
+                    .Any(binary => binary.IsKind(SyntaxKind.NotEqualsExpression) ||
+                                   binary.IsKind(SyntaxKind.GreaterThanExpression) ||
+                                   binary.IsKind(SyntaxKind.GreaterThanOrEqualExpression)) &&
+                statement.Statement.DescendantNodesAndSelf().OfType<ContinueStatementSyntax>().Any());
+            var hasQueueDrainLoop = nodes.OfType<WhileStatementSyntax>().Any(loop =>
+                loop.DescendantNodesAndSelf().OfType<InvocationExpressionSyntax>()
+                    .Any(invocation => GetInvokedName(invocation) is "TryDequeue" or "Dequeue"));
+            var hasAdjacencyTraversal = nodes.OfType<ForEachStatementSyntax>().Any(statement =>
+                statement.Expression.DescendantNodesAndSelf().OfType<ElementAccessExpressionSyntax>().Any());
+            var hasUnanalyzedHelperCalls = nodes.OfType<InvocationExpressionSyntax>().Any(invocation =>
+                methods.Any(candidate => candidate.Identifier.ValueText == GetInvokedName(invocation) &&
+                                         candidate.Identifier.ValueText != method.Identifier.ValueText));
+
+            return hasPriorityQueue && hasEnqueue && hasStaleEntryGuard && hasQueueDrainLoop &&
+                   hasAdjacencyTraversal && !hasUnanalyzedHelperCalls;
+        });
+    }
+
+    private static bool TryRecognizeHeapSort(SyntaxNode root, out string auxiliarySpace)
+    {
+        auxiliarySpace = "O(1)";
+        var methods = root.DescendantNodes().OfType<MethodDeclarationSyntax>().ToArray();
+        var siftDownMethods = methods.Where(method =>
+            method.Identifier.ValueText.Contains("SiftDown", StringComparison.OrdinalIgnoreCase) && method.Body is not null).ToArray();
+        if (siftDownMethods.Length == 0)
+            return false;
+
+        var heapifyMethods = methods.Where(method =>
+            (method.Identifier.ValueText.Contains("Heapify", StringComparison.OrdinalIgnoreCase) ||
+             method.Identifier.ValueText.Contains("BuildHeap", StringComparison.OrdinalIgnoreCase)) && method.Body is not null).ToArray();
+        var sortMethod = methods.FirstOrDefault(method => method.Body is not null &&
+            (method.Identifier.ValueText.Contains("HeapSort", StringComparison.OrdinalIgnoreCase) ||
+             heapifyMethods.Any(heapify => method.Body.DescendantNodes().OfType<InvocationExpressionSyntax>()
+                 .Any(invocation => GetInvokedName(invocation) == heapify.Identifier.ValueText)) &&
+             siftDownMethods.Any(siftDown => method.Body.DescendantNodes().OfType<InvocationExpressionSyntax>()
+                 .Any(invocation => GetInvokedName(invocation) == siftDown.Identifier.ValueText))));
+        if (sortMethod?.Body is null || !sortMethod.ParameterList.Parameters.Any(parameter => parameter.Type is ArrayTypeSyntax))
+            return false;
+
+        var heapMethods = siftDownMethods.Concat(heapifyMethods).Append(sortMethod).Distinct().ToArray();
+        if (heapMethods.Any(method => method.Body!.DescendantNodesAndSelf().OfType<InvocationExpressionSyntax>()
+                .Any(invocation => methods.Any(candidate => candidate.Identifier.ValueText == GetInvokedName(invocation)) &&
+                                   !heapMethods.Any(candidate => candidate.Identifier.ValueText == GetInvokedName(invocation)))))
+            return false;
+
+        if (heapMethods.Any(method => method.Body!.DescendantNodesAndSelf().OfType<ArrayCreationExpressionSyntax>().Any() ||
+                                      method.Body.DescendantNodesAndSelf().OfType<ObjectCreationExpressionSyntax>().Any()))
+            return false;
+
+        if (heapMethods.Any(method => method.Body!.DescendantNodesAndSelf().OfType<InvocationExpressionSyntax>()
+                .Any(invocation => GetInvokedName(invocation) == method.Identifier.ValueText)))
+            auxiliarySpace = "O(log n)";
+        return true;
+    }
+
+    private static bool TryRecognizeTopologicalSort(SyntaxNode root)
+    {
+        var methods = root.DescendantNodes().OfType<MethodDeclarationSyntax>().ToArray();
+        return methods.Any(method =>
+        {
+            if (!method.Identifier.ValueText.Contains("Topological", StringComparison.OrdinalIgnoreCase) || method.Body is null)
+                return false;
+
+            var nodes = method.Body.DescendantNodesAndSelf();
+            var hasQueue = nodes.OfType<GenericNameSyntax>().Any(name => name.Identifier.ValueText == "Queue");
+            var hasEnqueue = nodes.OfType<InvocationExpressionSyntax>()
+                .Any(invocation => GetInvokedName(invocation) == "Enqueue");
+            var hasDequeueLoop = nodes.OfType<WhileStatementSyntax>().Any(loop =>
+                loop.DescendantNodesAndSelf().OfType<InvocationExpressionSyntax>()
+                    .Any(invocation => GetInvokedName(invocation) == "Dequeue"));
+            var hasAdjacencyTraversal = nodes.OfType<ForEachStatementSyntax>().Any(statement =>
+                statement.Expression.DescendantNodesAndSelf().OfType<ElementAccessExpressionSyntax>().Any());
+            var hasIndegree = nodes.OfType<IdentifierNameSyntax>()
+                .Any(identifier => identifier.Identifier.ValueText.Contains("indegree", StringComparison.OrdinalIgnoreCase));
+            var callsHelper = nodes.OfType<InvocationExpressionSyntax>().Any(invocation =>
+                methods.Any(candidate => candidate.Identifier.ValueText == GetInvokedName(invocation) &&
+                                         candidate.Identifier.ValueText != method.Identifier.ValueText));
+
+            return hasQueue && hasEnqueue && hasDequeueLoop && hasAdjacencyTraversal && hasIndegree && !callsHelper;
+        });
+    }
+
+    private static bool TryRecognizeAdditionalAlgorithm(SyntaxNode root, out RecognizedAlgorithm estimate)
+    {
+        var methods = root.DescendantNodes().OfType<MethodDeclarationSyntax>().ToArray();
+        foreach (var method in methods)
+        {
+            if (method.Body is null)
+                continue;
+
+            var nodes = method.Body.DescendantNodesAndSelf();
+            if (method.Identifier.ValueText.Contains("TernarySearch", StringComparison.OrdinalIgnoreCase) &&
+                nodes.OfType<WhileStatementSyntax>().Any() &&
+                nodes.OfType<BinaryExpressionSyntax>().Any(binary => binary.IsKind(SyntaxKind.DivideExpression) && IsNumericLiteral(binary.Right) &&
+                    binary.Right is LiteralExpressionSyntax literal && Convert.ToDouble(literal.Token.Value) == 3) &&
+                nodes.OfType<ElementAccessExpressionSyntax>().Count() >= 2)
+            {
+                estimate = new RecognizedAlgorithm("O(log n)", "O(1)", "A ternary-search interval reduction was recognized.",
+                    "Ternary search assumes a sorted search space and a constant number of comparisons per iteration.",
+                    "The ternary-search pattern is inferred syntactically; sortedness and update correctness are not verified.");
+                return true;
+            }
+
+            if (method.Identifier.ValueText.Contains("InterpolationSearch", StringComparison.OrdinalIgnoreCase) &&
+                nodes.OfType<WhileStatementSyntax>().Any() &&
+                nodes.OfType<BinaryExpressionSyntax>().Any(binary => binary.IsKind(SyntaxKind.MultiplyExpression)) &&
+                nodes.OfType<ElementAccessExpressionSyntax>().Count() >= 2)
+            {
+                estimate = new RecognizedAlgorithm("O(n)", "O(1)", "Interpolation search was recognized using its worst-case bound.",
+                    "The displayed interpolation-search time is worst case; average O(log log n) requires uniformly distributed sorted keys.",
+                    "The interpolation-search pattern is inferred syntactically; data distribution and update correctness are not verified.");
+                return true;
+            }
+
+            if (method.Identifier.ValueText.Contains("JumpSearch", StringComparison.OrdinalIgnoreCase) &&
+                nodes.OfType<InvocationExpressionSyntax>().Any(invocation =>
+                    invocation.Expression is MemberAccessExpressionSyntax member && member.Name.Identifier.ValueText == "Sqrt") &&
+                nodes.OfType<WhileStatementSyntax>().Any() && nodes.OfType<ForStatementSyntax>().Any() &&
+                nodes.OfType<ElementAccessExpressionSyntax>().Any())
+            {
+                estimate = new RecognizedAlgorithm("O(sqrt n)", "O(1)", "A square-root jump-search block scan was recognized.",
+                    "Jump search assumes sorted input and jump size proportional to sqrt(n).",
+                    "The jump-search pattern is inferred syntactically; sortedness and jump-size correctness are not verified.");
+                return true;
+            }
+
+            if (method.Identifier.ValueText.Contains("Prim", StringComparison.OrdinalIgnoreCase) &&
+                nodes.OfType<GenericNameSyntax>().Any(name => name.Identifier.ValueText == "PriorityQueue") &&
+                nodes.OfType<InvocationExpressionSyntax>().Any(invocation => GetInvokedName(invocation) == "Enqueue") &&
+                nodes.OfType<WhileStatementSyntax>().Any(loop => loop.DescendantNodesAndSelf().OfType<InvocationExpressionSyntax>()
+                    .Any(invocation => GetInvokedName(invocation) is "TryDequeue" or "Dequeue")) &&
+                nodes.OfType<ForEachStatementSyntax>().Any(statement => statement.Expression.DescendantNodesAndSelf()
+                    .OfType<ElementAccessExpressionSyntax>().Any()) &&
+                nodes.OfType<ArrayCreationExpressionSyntax>().Any(array => array.Type.ElementType.ToString() == "bool") &&
+                nodes.OfType<ContinueStatementSyntax>().Any())
+            {
+                estimate = new RecognizedAlgorithm("O((V + E) log E)", "O(V + E)", "A lazy-priority-queue Prim traversal was recognized.",
+                    "Prim's bounds assume an adjacency-list graph and a binary heap that may store multiple edge candidates; input graph storage is excluded from auxiliary space.",
+                    "The Prim pattern is inferred syntactically; graph connectivity and MST correctness are not verified.");
+                return true;
+            }
+
+            if (TryRecognizeSieve(method, nodes))
+            {
+                estimate = new RecognizedAlgorithm("O(n log log n)", "O(n)", "A sieve marking multiples from each prime square was recognized.",
+                    "Sieve space includes the Boolean table through the input limit.",
+                    "The sieve pattern is inferred syntactically; prime-marking and boundary correctness are not verified.");
+                return true;
+            }
+        }
+
+        estimate = default;
+        return false;
+    }
+
+    private static bool TryRecognizeSieve(MethodDeclarationSyntax method, IEnumerable<SyntaxNode> nodes)
+    {
+        if (!method.Identifier.ValueText.Contains("Sieve", StringComparison.OrdinalIgnoreCase) ||
+            !nodes.OfType<ArrayCreationExpressionSyntax>().Any())
+            return false;
+
+        var loops = nodes.OfType<ForStatementSyntax>().ToArray();
+        return loops.Any(outer => outer.Condition?.DescendantNodesAndSelf().OfType<BinaryExpressionSyntax>()
+                   .Any(binary => binary.IsKind(SyntaxKind.MultiplyExpression)) == true &&
+               loops.Any(inner => inner.Ancestors().Contains(outer) &&
+                   inner.Incrementors.OfType<AssignmentExpressionSyntax>().Any(assignment =>
+                       assignment.IsKind(SyntaxKind.AddAssignmentExpression) &&
+                       assignment.Right is IdentifierNameSyntax prime &&
+                       outer.Declaration?.Variables.Any(variable => variable.Identifier.ValueText == prime.Identifier.ValueText) == true)));
+    }
+
+    private static int GetRecursiveCallsPerPath(SyntaxNode node, string methodName)
+    {
+        switch (node)
+        {
+            case InvocationExpressionSyntax invocation:
+                return (GetInvokedName(invocation) == methodName ? 1 : 0) +
+                       invocation.ArgumentList.Arguments.Sum(argument => GetRecursiveCallsPerPath(argument, methodName));
+            case IfStatementSyntax ifStatement:
+                return GetRecursiveCallsPerPath(ifStatement.Condition, methodName) +
+                       Math.Max(GetRecursiveCallsPerPath(ifStatement.Statement, methodName),
+                           ifStatement.Else is null ? 0 : GetRecursiveCallsPerPath(ifStatement.Else.Statement, methodName));
+            case ConditionalExpressionSyntax conditional:
+                return GetRecursiveCallsPerPath(conditional.Condition, methodName) +
+                       Math.Max(GetRecursiveCallsPerPath(conditional.WhenTrue, methodName),
+                           GetRecursiveCallsPerPath(conditional.WhenFalse, methodName));
+            case SwitchStatementSyntax switchStatement:
+                return GetRecursiveCallsPerPath(switchStatement.Expression, methodName) +
+                       (switchStatement.Sections.Select(section => section.Statements.Sum(statement =>
+                           GetRecursiveCallsPerPath(statement, methodName))).DefaultIfEmpty(0).Max());
+            case BlockSyntax block:
+                return block.Statements.Sum(statement => GetRecursiveCallsPerPath(statement, methodName));
+            default:
+                return node.ChildNodes().Sum(child => GetRecursiveCallsPerPath(child, methodName));
+        }
+    }
+
+    private static bool HasRecursiveCallInLoop(SyntaxNode body, string methodName, out bool unknownLoopBound)
+    {
+        unknownLoopBound = false;
+        var foundInputBound = false;
+        foreach (var invocation in body.DescendantNodesAndSelf().OfType<InvocationExpressionSyntax>()
+                     .Where(invocation => GetInvokedName(invocation) == methodName))
+        {
+            foreach (var loop in invocation.Ancestors().Where(IsLoopStatement))
+            {
+                var bound = GetLoopBound(loop);
+                if (bound.Unknown)
+                    unknownLoopBound = true;
+                else if (bound != Complexity.Constant)
+                    foundInputBound = true;
+            }
+        }
+        return foundInputBound;
+    }
+
+    private static Complexity EstimateRecursion(MethodDeclarationSyntax method, int recursiveCallsPerPath, bool recursiveCallInLoop, bool unknownLoopBound, Complexity localWork, HashSet<string> warnings, HashSet<string> assumptions)
+    {
         warnings.Add($"Recursive method '{method.Identifier.ValueText}' is estimated from its apparent argument reduction; termination and recurrence behavior are not proven.");
         assumptions.Add("Recursive calls are classified syntactically; mutual recursion, memoization, and nonstandard recurrences are not fully modeled.");
 
-        if (HasHalvingReduction(method.Body ?? (SyntaxNode?)method.ExpressionBody ?? method))
-            return recursiveCalls > 1 ? Complexity.Linearithmic : Complexity.Logarithmic;
-        return recursiveCalls > 1 ? Complexity.ExponentialComplexity : Complexity.Linear;
+        if (localWork.Unknown || unknownLoopBound)
+            return Complexity.UnknownComplexity;
+
+        if (HasHalvingReduction(method))
+        {
+            if (recursiveCallInLoop)
+                return Complexity.UnknownComplexity;
+            if (recursiveCallsPerPath > 1)
+                return localWork.Degree > 0 ? Complexity.Linearithmic : Complexity.Linear;
+            return localWork.Degree > 0 ? localWork : Complexity.Logarithmic;
+        }
+
+        if (HasLinearReduction(method))
+        {
+            if (recursiveCallInLoop)
+                return Complexity.FactorialComplexity;
+            if (recursiveCallsPerPath > 1)
+                return Complexity.ExponentialComplexity;
+            return localWork.Degree > 0 ? Complexity.Linear.Multiply(localWork) : Complexity.Linear;
+        }
+
+        warnings.Add($"The recursive reduction in '{method.Identifier.ValueText}' is not recognized; time complexity is reported as unknown.");
+        return Complexity.UnknownComplexity;
     }
 
-    private static bool HasHalvingReduction(SyntaxNode node)
+    private static bool HasHalvingReduction(MethodDeclarationSyntax method)
     {
-        var text = node.ToString();
-        return text.Contains("/ 2", StringComparison.Ordinal) || text.Contains(">> 1", StringComparison.Ordinal);
+        var body = method.Body ?? (SyntaxNode?)method.ExpressionBody;
+        if (body is null)
+            return false;
+
+        var halvedVariables = body.DescendantNodes().OfType<VariableDeclaratorSyntax>()
+            .Where(variable => IsHalvingExpression(variable.Initializer?.Value))
+            .Select(variable => variable.Identifier.ValueText)
+            .Concat(body.DescendantNodes().OfType<AssignmentExpressionSyntax>()
+                .Where(assignment => IsHalvingExpression(assignment.Right) && assignment.Left is IdentifierNameSyntax)
+                .Select(assignment => ((IdentifierNameSyntax)assignment.Left).Identifier.ValueText))
+            .ToHashSet(StringComparer.Ordinal);
+
+        return body.DescendantNodesAndSelf().OfType<InvocationExpressionSyntax>()
+            .Where(invocation => GetInvokedName(invocation) == method.Identifier.ValueText)
+            .Any(invocation => invocation.ArgumentList.Arguments.Any(argument =>
+                IsHalvingExpression(argument.Expression) || argument.Expression.DescendantNodesAndSelf()
+                    .OfType<IdentifierNameSyntax>().Any(identifier => halvedVariables.Contains(identifier.Identifier.ValueText))));
+    }
+
+    private static bool HasLinearReduction(MethodDeclarationSyntax method)
+    {
+        var body = method.Body ?? (SyntaxNode?)method.ExpressionBody;
+        if (body is null)
+            return false;
+
+        var parameters = method.ParameterList.Parameters.Select(parameter => parameter.Identifier.ValueText)
+            .ToHashSet(StringComparer.Ordinal);
+        return body.DescendantNodesAndSelf().OfType<InvocationExpressionSyntax>()
+            .Where(invocation => GetInvokedName(invocation) == method.Identifier.ValueText)
+            .SelectMany(invocation => invocation.ArgumentList.Arguments)
+            .Select(argument => argument.Expression)
+            .OfType<BinaryExpressionSyntax>()
+            .Any(binary => (binary.IsKind(SyntaxKind.SubtractExpression) || binary.IsKind(SyntaxKind.AddExpression)) &&
+                           binary.Left is IdentifierNameSyntax identifier && parameters.Contains(identifier.Identifier.ValueText) &&
+                           IsNumericLiteral(binary.Right));
     }
 
     private static Complexity AnalyzeSpace(SyntaxNode body, HashSet<string> warnings)
@@ -394,16 +924,18 @@ public sealed class ComplexityAnalyzerService
         var result = Complexity.Constant;
         foreach (var array in body.DescendantNodes().OfType<ArrayCreationExpressionSyntax>())
         {
-            var loopMultiplier = GetEnclosingLoopMultiplier(array, warnings);
-            if (loopMultiplier != Complexity.Constant)
+            var retainedAcrossIterations = IsAllocationRetained(array);
+            var loopMultiplier = retainedAcrossIterations ? GetEnclosingLoopMultiplier(array, warnings) : Complexity.Constant;
+            if (retainedAcrossIterations && loopMultiplier != Complexity.Constant)
                 warnings.Add("Array allocations inside loops are assumed to remain live when estimating auxiliary space.");
             result = Complexity.Max(result, GetArraySizeComplexity(array).Multiply(loopMultiplier));
         }
         foreach (var creation in body.DescendantNodes().OfType<ObjectCreationExpressionSyntax>())
         {
-            var loopMultiplier = GetEnclosingLoopMultiplier(creation, warnings);
+            var retainedAcrossIterations = IsAllocationRetained(creation);
+            var loopMultiplier = retainedAcrossIterations ? GetEnclosingLoopMultiplier(creation, warnings) : Complexity.Constant;
             var collectionSpace = GetCollectionCreationComplexity(creation);
-            if (loopMultiplier != Complexity.Constant && collectionSpace != Complexity.Constant)
+            if (retainedAcrossIterations && loopMultiplier != Complexity.Constant && collectionSpace != Complexity.Constant)
                 warnings.Add("Collection allocations inside loops are assumed to remain live when estimating auxiliary space.");
             result = Complexity.Max(result, collectionSpace.Multiply(loopMultiplier));
         }
@@ -411,7 +943,8 @@ public sealed class ComplexityAnalyzerService
         foreach (var invocation in body.DescendantNodes().OfType<InvocationExpressionSyntax>())
         {
             var name = GetInvokedName(invocation);
-            if (name is "ToList" or "ToArray" or "ToDictionary" or "ToLookup" or "GroupBy" or "Distinct" or
+            if (invocation.Expression is MemberAccessExpressionSyntax &&
+                name is "ToList" or "ToArray" or "ToDictionary" or "ToLookup" or "GroupBy" or "Distinct" or
                 "Union" or "Intersect" or "Except" or "Reverse" or "OrderBy" or "OrderByDescending")
             {
                 var loopMultiplier = GetEnclosingLoopMultiplier(invocation, warnings);
@@ -429,6 +962,48 @@ public sealed class ComplexityAnalyzerService
         if (body.DescendantNodes().OfType<StackAllocArrayCreationExpressionSyntax>().Any())
             warnings.Add("Stack allocation size is not incorporated into auxiliary-space growth estimates.");
         return result;
+    }
+
+    private static bool IsAllocationRetained(SyntaxNode allocation)
+    {
+        if (allocation.Parent is EqualsValueClauseSyntax &&
+            allocation.Parent.Parent is VariableDeclaratorSyntax variable)
+            return IsStoredAcrossIterations(variable, allocation);
+        if (allocation.Parent is AssignmentExpressionSyntax assignment)
+            return assignment.Left is not IdentifierNameSyntax;
+        if (allocation.Parent is ArgumentSyntax argument &&
+            argument.Parent?.Parent is InvocationExpressionSyntax invocation &&
+            GetInvokedName(invocation) is "Add" or "AddRange" or "Enqueue" or "Push")
+            return true;
+        return true;
+    }
+
+    private static bool IsStoredAcrossIterations(VariableDeclaratorSyntax variable, SyntaxNode allocation)
+    {
+        var loop = allocation.Ancestors().FirstOrDefault(IsLoopStatement);
+        if (loop is null)
+            return false;
+
+        var loopBody = loop switch
+        {
+            ForStatementSyntax statement => statement.Statement,
+            ForEachStatementSyntax statement => statement.Statement,
+            ForEachVariableStatementSyntax statement => statement.Statement,
+            WhileStatementSyntax statement => statement.Statement,
+            DoStatementSyntax statement => statement.Statement,
+            _ => null
+        };
+        if (loopBody is null)
+            return false;
+
+        var name = variable.Identifier.ValueText;
+        return loopBody.DescendantNodesAndSelf().OfType<InvocationExpressionSyntax>().Any(invocation =>
+                   GetInvokedName(invocation) is "Add" or "AddRange" or "Enqueue" or "Push" &&
+                   invocation.ArgumentList.Arguments.Any(argument => argument.Expression.DescendantNodesAndSelf()
+                       .OfType<IdentifierNameSyntax>().Any(identifier => identifier.Identifier.ValueText == name))) ||
+               loopBody.DescendantNodesAndSelf().OfType<AssignmentExpressionSyntax>().Any(assignment =>
+                   assignment.Left is not IdentifierNameSyntax && assignment.Right.DescendantNodesAndSelf()
+                       .OfType<IdentifierNameSyntax>().Any(identifier => identifier.Identifier.ValueText == name));
     }
 
     private static bool IsInsideLoop(SyntaxNode node) => node.Ancestors().Any(ancestor => ancestor is ForStatementSyntax or ForEachStatementSyntax or WhileStatementSyntax or DoStatementSyntax);
@@ -466,7 +1041,9 @@ public sealed class ComplexityAnalyzerService
     private static bool IsNumericLiteral(ExpressionSyntax expression) =>
         expression is LiteralExpressionSyntax literal && IsNumeric(literal.Token.Value!);
 
-    private readonly record struct Complexity(int Degree, int LogarithmicPower, bool Exponential = false, bool Unknown = false)
+    private readonly record struct RecognizedAlgorithm(string Time, string Space, string Explanation, string Assumption, string Warning);
+
+    private readonly record struct Complexity(int Degree, int LogarithmicPower, bool Exponential = false, bool Factorial = false, bool Unknown = false)
     {
         public bool IsLogarithmic => LogarithmicPower > 0 && Degree == 0;
 
@@ -475,12 +1052,14 @@ public sealed class ComplexityAnalyzerService
         public static Complexity Logarithmic => new(0, 1);
         public static Complexity Linearithmic => new(1, 1);
         public static Complexity ExponentialComplexity => new(0, 0, Exponential: true);
+        public static Complexity FactorialComplexity => new(0, 0, Factorial: true);
         public static Complexity UnknownComplexity => new(0, 0, Unknown: true);
 
         public Complexity Multiply(Complexity other) => new(
             Degree + other.Degree,
             LogarithmicPower + other.LogarithmicPower,
             Exponential || other.Exponential,
+            Factorial || other.Factorial,
             Unknown || other.Unknown);
 
         public static Complexity Max(params Complexity[] values)
@@ -494,6 +1073,8 @@ public sealed class ComplexityAnalyzerService
 
         private static int Compare(Complexity left, Complexity right)
         {
+            if (left.Factorial != right.Factorial)
+                return left.Factorial ? 1 : -1;
             if (left.Exponential != right.Exponential)
                 return left.Exponential ? 1 : -1;
             if (left.Degree != right.Degree)
@@ -505,6 +1086,8 @@ public sealed class ComplexityAnalyzerService
         {
             if (Unknown)
                 return "Unknown (input-dependent)";
+            if (Factorial)
+                return Degree == 0 ? "O(n!)" : $"O(n^{Degree} n!)";
             if (Exponential)
                 return "O(2^n)";
             if (Degree == 0 && LogarithmicPower == 0)
